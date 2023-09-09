@@ -5,6 +5,7 @@
 #include "../../ECUAL/UART/STM32_UART.h"
 #include "../../ECUAL/PID_motor/motor_commands.h"
 #include "../../ECUAL/PID_motor/PID_motor.h"
+#include "../../ECUAL/PID_motor/PID_motor_cfg.h"
 
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
@@ -27,7 +28,10 @@ static void commandHandling(uint8_t* rcv_buffer);
 #define BUFFER_SIZE 20
 uint8_t rcv_buffer[BUFFER_SIZE] = {0};
 uint8_t tx_buffer[45];
-unsigned int wheel_velocities[2];
+
+// Buffer to store the commands
+int wheel_velocities[2];
+int pid_params[4];
 
 int main(void)
 {
@@ -35,6 +39,9 @@ int main(void)
   HAL_Init();
   SystemClock_Config();
   MX_GPIO_Init();
+  // Initiate the GPIO of the motor
+  motorInit(motor1);
+
   MX_DMA_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
@@ -43,6 +50,12 @@ int main(void)
   
   // Initiate UART DMA IDLE line detection
   STM32_UART_IDLE_Start(&huart1, &hdma_usart1_rx, rcv_buffer, BUFFER_SIZE);
+  STM32_UART_sendString(&huart1, (uint8_t*)"Hello Vinh Gia\r\n");
+
+  // Initiate the PWm module of the motor
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
+  // Initiate the encoder module
+  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
 
   // Main duty
   while (1)
@@ -54,6 +67,15 @@ int main(void)
   return 0;
 }
 
+// Function to handle timer interrupt callback 
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
+{
+  if(htim->Instance == TIM2)
+  {
+    speedControlPID(&motor1);
+  }
+}
+
 // Function to handle UART reception interrupt
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t msg_size)
 {
@@ -61,7 +83,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t msg_size)
   if(huart->Instance == USART1)
   {
     // Transmit the message back for debugging
-    sprintf(tx_buffer, "Received: %s", rcv_buffer);
+    sprintf((char*)tx_buffer, "Received: %s", rcv_buffer);
     STM32_UART_sendString(huart, tx_buffer);
     
     // Extract the command data
@@ -76,18 +98,27 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t msg_size)
 static void commandHandling(uint8_t* rcv_buffer)
 {
   uint8_t command = rcv_buffer[0];
-  if(strlen(rcv_buffer) == 1)
+  if(strlen((char*)rcv_buffer) == 1)
   {
     switch(command)
     {
-      case ENCODER_READ:
+      // Get the encoder value of the specific motor and transmit it via UART
+      case ENCODER_READ: ;
+        int32_t motor1_enc = readEncoder(&motor1);
+        sprintf((char*)tx_buffer, "Encoder: %ld\r\n", motor1_enc);
+        STM32_UART_sendString(&huart1, tx_buffer);
         break;
-      case GET_BAUDRATE:
+      case GET_BAUDRATE: ;
+        uint32_t uart_baudrate = huart1.Init.BaudRate;
+        sprintf((char*)tx_buffer,"Baudrate: %ld\r\n", uart_baudrate);
+        STM32_UART_sendString(&huart1, tx_buffer);
         break;
       case PING:
+        sprintf((char*)tx_buffer,"STM32 active\r\n");
+        STM32_UART_sendString(&huart1, tx_buffer);
         break;
       default:
-        STM32_UART_sendString(&huart1, "Command error!");
+        STM32_UART_sendString(&huart1, (uint8_t*)"Command error!");
         break;
     }
   }
@@ -99,7 +130,7 @@ static void commandHandling(uint8_t* rcv_buffer)
       // Get the actual velocity command 
       uint8_t command_idx = 0;
       char* rest = NULL;
-      char* token = strtok_r(rcv_buffer, " ", &rest);
+      char* token = strtok_r((char*)rcv_buffer, " ", &rest);
       while(token != NULL)
       {
         if(command_idx > 0)
@@ -109,6 +140,7 @@ static void commandHandling(uint8_t* rcv_buffer)
           command_idx = 0;
         token = strtok_r(NULL, " ", &rest);
       }
+      inputSpeedHandling(&htim2, &motor1, wheel_velocities[0]);
     }
     else if(command == MOTOR_POSITION)
     {
@@ -116,7 +148,21 @@ static void commandHandling(uint8_t* rcv_buffer)
     }
     else if(command == UPDATE_PID)
     {
-      
+      // Get the actual velocity command 
+      uint8_t command_idx = 0;
+      char* rest = NULL;
+      char* token = strtok_r((char*)rcv_buffer, " ", &rest);
+      while(token != NULL)
+      {
+        if(command_idx > 0)
+          pid_params[command_idx - 1] = atoi(token);
+        // Constraint the index value 
+        if(++command_idx == 5) 
+          command_idx = 0;
+        token = strtok_r(NULL, " ", &rest);
+      }
+      // Call function to update the PID values
+      updatePID(pid_params);
     }
   }
 }
