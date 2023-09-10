@@ -7,5 +7,6 @@
 #define MOTOR_POSITION      'm'
 #define UPDATE_PID          'u'
 #define GET_BAUDRATE        'b'
+#define RESET_PID           'r'
 
 #endif

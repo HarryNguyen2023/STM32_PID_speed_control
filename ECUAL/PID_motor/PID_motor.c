@@ -11,28 +11,27 @@ uint16_t time_frame = 5;    // Time frame to milisecond
 
 // ----------------------------------------------------- Static functions hidden from users ----------------------------------------------
 // Function prototypes
-static void resetPID(PID_motor* motor);
 static void outputPID(PID_motor* motor);
 static void dutyCycleUpdate(uint16_t duty_cycle, PID_motor* motor);
-
-// Function to reset the PID value of the motor when it is not moving
-static void resetPID(PID_motor* motor)
-{
-    motor->current_encoder = readEncoder(motor);
-    motor->prev_encoder = motor->current_encoder;
-    motor->integral_error = 0;
-    motor->output = 0;
-    motor->prev_encoder_feedback = 0;
-    motor->targetPulsePerFrame = 0.0;
-}
 
 // Function to get the output value of the PID speed controller
 static void outputPID(PID_motor* motor)
 {
-    int16_t feedback, output;
-    double error;
+    int32_t feedback, output;
+    float error;
     // Get number of the encoder pulse in the last time frame
-    feedback = motor->current_encoder - motor->prev_encoder;
+    if(motor->direction == 0 && motor->current_encoder < motor->prev_encoder)
+    {
+        feedback = (65535 / 4) - motor->prev_encoder;
+        feedback += motor->current_encoder;
+    }
+    else if(motor->direction == 1 && motor->current_encoder > motor->prev_encoder)
+    {
+        feedback = motor->current_encoder - (65535 / 4);
+        feedback -= motor->prev_encoder;
+    }
+    else
+        feedback = motor->current_encoder - motor->prev_encoder;
     // Get the error of the number of encoder per time frame
     error = motor->targetPulsePerFrame - feedback;
     // Get the output of the PID controller with the new formula to avoid derivative kick as well as accumulation error when updating PID parameters
@@ -100,9 +99,9 @@ void motorInit(PID_motor motor)
 }
 
 // Function to get the encoder value of the motor
-int32_t readEncoder(PID_motor* motor)
+uint32_t readEncoder(PID_motor* motor)
 {
-    return ((int32_t)motor->encoder_tim->CNT) / 4;
+    return motor->encoder_tim->CNT / 4;
 }
 
 // Function to brake the motor immediately
@@ -121,8 +120,21 @@ void updatePID(int* pid_params)
     Ko = pid_params[3];
 }
 
+// Function to reset the PID value of the motor when it is not moving
+void resetPID(PID_motor* motor)
+{
+    motor->current_encoder = readEncoder(motor);
+    motor->prev_encoder = motor->current_encoder;
+    motor->integral_error = 0;
+    motor->output = 0;
+    motor->prev_encoder_feedback = 0;
+    motor->targetPulsePerFrame = 0.0;
+    motor->moving = 0;
+    motor->direction = 0;
+}
+
 // Function to handle the speed input of the PID controller
-void inputSpeedHandling(TIM_HandleTypeDef* htim, PID_motor* motor, int speed)
+float inputSpeedHandling(TIM_HandleTypeDef* htim, PID_motor* motor, int speed)
 {
     // Rescale the input rpm speed
     if(speed > motor->MAX_INPUT_SPEED)
@@ -132,14 +144,19 @@ void inputSpeedHandling(TIM_HandleTypeDef* htim, PID_motor* motor, int speed)
     // Check if command the motor to stop
     if(speed == 0)
     {
+        dutyCycleUpdate(0, motor);
         motorBrake(motor);
         motor->moving = 0;
         // Stop the timer 
         HAL_TIM_Base_Stop_IT(htim);
         // Reaset the PID value
         resetPID(motor);
-        return;
+        return 0;
     }
+    else if(speed > 0)
+        motor->direction = 0;
+    else
+        motor->direction = 1;
     // Check whether the motor is already moving
     if(! motor->moving)
     {
@@ -149,6 +166,7 @@ void inputSpeedHandling(TIM_HandleTypeDef* htim, PID_motor* motor, int speed)
     }
     // Convert the desired speed to pulse per frame and input to the motor
     motor->targetPulsePerFrame = (speed * motor->encoder_rev * 1.0) * time_frame / 60000.0;
+    return motor->targetPulsePerFrame;
 }
 
 // Function to control the speed of the motor by PID algorithm
@@ -159,25 +177,18 @@ void speedControlPID(PID_motor* motor)
     // Update the PID output of the controller
     outputPID(motor);
 
-    // Get the direction of the motor
-    uint8_t direction;
-    if(motor->output >= 0)
-        direction = 0;
-    else
-        direction = 1;
-
     // Get the absolute value of the motor
     uint16_t pwm_dutycycle = abs(motor->output);
     if(pwm_dutycycle < motor->DEAD_BAND)
         pwm_dutycycle = motor->DEAD_BAND;
 
     // Control the direction of the motor
-    if(direction == 0)
+    if(motor->direction == 0)
     {
         HAL_GPIO_WritePin(motor->motor_ports[0], motor->motor_pins[0], 1);
         HAL_GPIO_WritePin(motor->motor_ports[1], motor->motor_pins[1], 0);
     }
-    else if(direction == 1)
+    else if(motor->direction == 1)
     {
         HAL_GPIO_WritePin(motor->motor_ports[0], motor->motor_pins[0], 0);
         HAL_GPIO_WritePin(motor->motor_ports[1], motor->motor_pins[1], 1);

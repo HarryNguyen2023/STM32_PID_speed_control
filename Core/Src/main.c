@@ -22,7 +22,7 @@ static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_USART1_UART_Init(void);
-static void commandHandling(uint8_t* rcv_buffer);
+static void commandHandling(uint8_t* rcv_buffer, uint16_t msg_size);
 
 // Global variables
 #define BUFFER_SIZE 20
@@ -82,12 +82,11 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t msg_size)
   // Check if the interrurpt source is due to usart 1 module
   if(huart->Instance == USART1)
   {
-    // Transmit the message back for debugging
-    sprintf((char*)tx_buffer, "Received: %s", rcv_buffer);
-    STM32_UART_sendString(huart, tx_buffer);
-    
     // Extract the command data
-    commandHandling(rcv_buffer);
+    commandHandling(rcv_buffer, msg_size);
+
+    // Clear the bufer
+    memset(rcv_buffer, 0, BUFFER_SIZE);
 
     // Restart the UART DMA IDLE line reception
     STM32_UART_IDLE_Start(huart, &hdma_usart1_rx, rcv_buffer, BUFFER_SIZE); 
@@ -95,27 +94,30 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t msg_size)
 }
 
 // Function to extract data from command message sent via UART 
-static void commandHandling(uint8_t* rcv_buffer)
+static void commandHandling(uint8_t* rcv_buffer, uint16_t msg_size)
 {
   uint8_t command = rcv_buffer[0];
-  if(strlen((char*)rcv_buffer) == 1)
+  if(msg_size == 1)
   {
     switch(command)
     {
       // Get the encoder value of the specific motor and transmit it via UART
       case ENCODER_READ: ;
-        int32_t motor1_enc = readEncoder(&motor1);
-        sprintf((char*)tx_buffer, "Encoder: %ld\r\n", motor1_enc);
+        uint32_t motor1_enc = readEncoder(&motor1);
+        sprintf((char*)tx_buffer, "Encoder: %lu\r\n", motor1_enc);
         STM32_UART_sendString(&huart1, tx_buffer);
         break;
       case GET_BAUDRATE: ;
         uint32_t uart_baudrate = huart1.Init.BaudRate;
-        sprintf((char*)tx_buffer,"Baudrate: %ld\r\n", uart_baudrate);
+        sprintf((char*)tx_buffer,"Baudrate: %lu\r\n", uart_baudrate);
         STM32_UART_sendString(&huart1, tx_buffer);
         break;
       case PING:
-        sprintf((char*)tx_buffer,"STM32 active\r\n");
-        STM32_UART_sendString(&huart1, tx_buffer);
+        STM32_UART_sendString(&huart1, (uint8_t*)"STM32 active\r\n");
+        break;
+      case RESET_PID:
+        resetPID(&motor1);
+        STM32_UART_sendString(&huart1, (uint8_t*)"Reset the motor\r\n");
         break;
       default:
         STM32_UART_sendString(&huart1, (uint8_t*)"Command error!");
@@ -140,7 +142,10 @@ static void commandHandling(uint8_t* rcv_buffer)
           command_idx = 0;
         token = strtok_r(NULL, " ", &rest);
       }
-      inputSpeedHandling(&htim2, &motor1, wheel_velocities[0]);
+      float target = inputSpeedHandling(&htim2, &motor1, wheel_velocities[0]);
+      // For debugging
+      sprintf((char*)tx_buffer,"Speed: %d - %.3f\r\n", wheel_velocities[0], target);
+      STM32_UART_sendString(&huart1, tx_buffer);
     }
     else if(command == MOTOR_POSITION)
     {
