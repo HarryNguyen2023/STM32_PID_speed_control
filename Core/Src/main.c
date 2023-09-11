@@ -24,6 +24,12 @@ static void MX_TIM4_Init(void);
 static void MX_USART1_UART_Init(void);
 static void commandHandling(uint8_t* rcv_buffer, uint16_t msg_size);
 
+typedef enum
+{
+  SPEED_CONTROLLER,
+  POSITION_CONTROLLER
+}Motor_controller;
+
 // Global variables
 #define BUFFER_SIZE 20
 uint8_t rcv_buffer[BUFFER_SIZE] = {0};
@@ -32,6 +38,8 @@ uint8_t tx_buffer[45];
 // Buffer to store the commands
 int wheel_velocities[2];
 int pid_params[4];
+int position_params[3];
+Motor_controller controller;
 
 int main(void)
 {
@@ -72,7 +80,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
 {
   if(htim->Instance == TIM2)
   {
-    speedControlPID(&motor1);
+    switch (controller)
+    {
+    case SPEED_CONTROLLER:
+      speedControlPID(&motor1);
+      break;
+    case POSITION_CONTROLLER: ;
+      positionControlPID(&htim2, &motor1);
+      sprintf((char*)tx_buffer, "%.2f - %.2f - %.2f - %ld\r\n", motor1.targetPulsePerFrame, motor1.motion_profile.command_position, motor1.motion_profile.command_velocity ,motor1.motion_profile.current_position);
+      STM32_UART_sendString(&huart1, tx_buffer);
+      break;
+    default:
+      break;
+    }
   }
 }
 
@@ -120,7 +140,7 @@ static void commandHandling(uint8_t* rcv_buffer, uint16_t msg_size)
         STM32_UART_sendString(&huart1, (uint8_t*)"Reset the motor\r\n");
         break;
       default:
-        STM32_UART_sendString(&huart1, (uint8_t*)"Command error!");
+        STM32_UART_sendString(&huart1, (uint8_t*)"Command error!\r\n");
         break;
     }
   }
@@ -129,6 +149,7 @@ static void commandHandling(uint8_t* rcv_buffer, uint16_t msg_size)
     // Case control the velocity of the motor
     if(command == VELOCITY_CONTROL)
     {
+      controller = SPEED_CONTROLLER;
       // Get the actual velocity command 
       uint8_t command_idx = 0;
       char* rest = NULL;
@@ -149,7 +170,22 @@ static void commandHandling(uint8_t* rcv_buffer, uint16_t msg_size)
     }
     else if(command == MOTOR_POSITION)
     {
-
+      controller = POSITION_CONTROLLER;
+      // Get the actual velocity command 
+      uint8_t command_idx = 0;
+      char* rest = NULL;
+      char* token = strtok_r((char*)rcv_buffer, " ", &rest);
+      while(token != NULL)
+      {
+        if(command_idx > 0)
+          position_params[command_idx - 1] = atoi(token);
+        // Constraint the index value 
+        if(++command_idx == 4) 
+          command_idx = 0;
+        token = strtok_r(NULL, " ", &rest);
+      }
+      if(! inputPositionHandling(&htim2, &motor1, position_params[0], position_params[1], position_params[2]))
+          STM32_UART_sendString(&huart1, (uint8_t*)"Command error!\r\n");
     }
     else if(command == UPDATE_PID)
     {

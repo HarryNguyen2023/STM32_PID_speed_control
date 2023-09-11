@@ -3,7 +3,7 @@
 #include <stdlib.h>
 
 // Define some PID variables
-int Kp = 20;
+int Kp = 25;
 int Ki = 0;
 int Kd = 12;
 int Ko = 50;
@@ -11,21 +11,24 @@ uint16_t time_frame = 5;    // Time frame to milisecond
 
 // ----------------------------------------------------- Static functions hidden from users ----------------------------------------------
 // Function prototypes
-static void outputPID(PID_motor* motor);
+static void outputSpeedPID(PID_motor* motor);
+static void updatePosition(PID_motor* motor);
 static void dutyCycleUpdate(uint16_t duty_cycle, PID_motor* motor);
+static void resetEncoder(PID_motor* motor);
+static uint8_t motionProfileTracking(PID_motor* motor);
 
 // Function to get the output value of the PID speed controller
-static void outputPID(PID_motor* motor)
+static void outputSpeedPID(PID_motor* motor)
 {
     int32_t feedback, output;
     float error;
     // Get number of the encoder pulse in the last time frame
-    if(motor->direction == 0 && motor->current_encoder < motor->prev_encoder)
+    if(motor->direction == 0 && (motor->current_encoder < motor->prev_encoder) && (motor->prev_encoder - motor->current_encoder > 16000))
     {
         feedback = (65535 / 4) - motor->prev_encoder;
         feedback += motor->current_encoder;
     }
-    else if(motor->direction == 1 && motor->current_encoder > motor->prev_encoder)
+    else if(motor->direction == 1 && (motor->current_encoder > motor->prev_encoder) && (motor->current_encoder - motor->prev_encoder > 16000) )
     {
         feedback = motor->current_encoder - (65535 / 4);
         feedback -= motor->prev_encoder;
@@ -69,6 +72,92 @@ static void dutyCycleUpdate(uint16_t duty_cycle, PID_motor* motor)
     default:
         break;
     }
+}
+
+// Function to generate the motion progile for the motor
+static uint8_t motionProfileTracking(PID_motor* motor)
+{
+    // Case in the 1st phase of the mottion
+    if(motor->motion_profile.phase == 0)
+    {
+        // Accelerate till the motor reach the maximum velocity
+        if(motor->motion_profile.command_velocity < motor->motion_profile.motion_velocity)
+        {
+            motor->motion_profile.command_velocity += motor->motion_profile.motion_acceleration;
+            if(motor->motion_profile.command_velocity > motor->motion_profile.motion_velocity)
+            {
+                motor->motion_profile.command_velocity = motor->motion_profile.motion_velocity;
+            }
+        }
+                
+        // Count the number of frame running at maximum speed
+        if(motor->motion_profile.command_velocity == motor->motion_profile.motion_velocity)
+        {
+            motor->motion_profile.max_speed_count++;
+        }
+        
+        // Decrease the distance to be travelled
+        motor->motion_profile.phase_dist -= motor->motion_profile.command_velocity;
+        
+        // Get the command position for each frame
+        if(motor->direction == 0)
+            motor->motion_profile.command_position += motor->motion_profile.command_velocity;
+        else if(motor->direction == 1)
+            motor->motion_profile.command_position -= motor->motion_profile.command_velocity;
+
+        // Check if phase 1 has been completed
+        if(motor->motion_profile.phase_dist <= 0)
+            motor->motion_profile.phase = 1;
+    }
+    else
+    {
+        if(motor->motion_profile.max_speed_count)
+            motor->motion_profile.max_speed_count--;
+        else if(motor->motion_profile.command_velocity > 0)
+        {   
+            motor->motion_profile.command_velocity -= motor->motion_profile.motion_acceleration;
+            // End of movement
+            if(motor->motion_profile.command_velocity < 0)
+            {
+                motor->moving = 0;           
+                return 1;
+            }
+        }
+        // Update the command position of the robot
+        if(motor->direction == 0)
+            motor->motion_profile.command_position += motor->motion_profile.command_velocity;
+        else if(motor->direction == 1)
+            motor->motion_profile.command_position -= motor->motion_profile.command_velocity;
+    }
+    return 0;
+}
+
+// Function to reset the encoder value of the motor
+static void resetEncoder(PID_motor* motor)
+{
+    motor->encoder_tim->CNT = 0;
+}
+
+// Function to get the ouput of the position P controller
+static void updatePosition(PID_motor* motor)
+{
+    int32_t feedback;
+    // Update the position of the robot
+    motor->current_encoder = readEncoder(motor);
+    // Get number of the encoder pulse in the last time frame
+    if(motor->direction == 0 && motor->current_encoder < motor->prev_encoder)
+    {
+        feedback = (65535 / 4) - motor->prev_encoder;
+        feedback += motor->current_encoder;
+    }
+    else if(motor->direction == 1 && motor->current_encoder > motor->prev_encoder)
+    {
+        feedback = motor->current_encoder - (65535 / 4);
+        feedback -= motor->prev_encoder;
+    }
+    else
+        feedback = motor->current_encoder - motor->prev_encoder;
+    motor->motion_profile.current_position += feedback;
 }
 
 // -------------------------------------------------------- General function used by users -----------------------------------------------
@@ -123,6 +212,8 @@ void updatePID(int* pid_params)
 // Function to reset the PID value of the motor when it is not moving
 void resetPID(PID_motor* motor)
 {
+    // Re-initiate the PID parametrs
+    resetEncoder(motor);
     motor->current_encoder = readEncoder(motor);
     motor->prev_encoder = motor->current_encoder;
     motor->integral_error = 0;
@@ -131,6 +222,15 @@ void resetPID(PID_motor* motor)
     motor->targetPulsePerFrame = 0.0;
     motor->moving = 0;
     motor->direction = 0;
+    motor->motion_profile.command_position = 0;
+    motor->motion_profile.command_velocity = 0;
+    motor->motion_profile.current_position = 0;
+    motor->motion_profile.max_speed_count = 0;
+    motor->motion_profile.motion_acceleration = 0;
+    motor->motion_profile.motion_velocity = 0;
+    motor->motion_profile.target_position = 0;
+    motor->motion_profile.phase_dist = 0;
+    motor->motion_profile.phase = 1;
 }
 
 // Function to handle the speed input of the PID controller
@@ -146,11 +246,10 @@ float inputSpeedHandling(TIM_HandleTypeDef* htim, PID_motor* motor, int speed)
     {
         dutyCycleUpdate(0, motor);
         motorBrake(motor);
-        motor->moving = 0;
-        // Stop the timer 
-        HAL_TIM_Base_Stop_IT(htim);
         // Reaset the PID value
         resetPID(motor);
+        // Stop the timer 
+        HAL_TIM_Base_Stop_IT(htim);
         return 0;
     }
     else if(speed > 0)
@@ -175,7 +274,7 @@ void speedControlPID(PID_motor* motor)
     // Update the motor encoder value
     motor->current_encoder = readEncoder(motor);
     // Update the PID output of the controller
-    outputPID(motor);
+    outputSpeedPID(motor);
 
     // Get the absolute value of the motor
     uint16_t pwm_dutycycle = abs(motor->output);
@@ -197,3 +296,68 @@ void speedControlPID(PID_motor* motor)
     dutyCycleUpdate(pwm_dutycycle, motor);
 }
 
+// Function to handle the input command of the position control 
+uint8_t inputPositionHandling(TIM_HandleTypeDef* htim, PID_motor* motor, int32_t position_angle, uint16_t motion_velocity, uint16_t motion_acel)
+{
+    // Brake the motor 
+    motorBrake(motor);
+    resetPID(motor);
+    if(position_angle == 0 || motion_velocity <= 0 || motion_acel <= 0)
+        return 0;
+    // Convert the target position to number of pulse
+    motor->motion_profile.target_position = abs(position_angle * motor->encoder_rev) / 360.0;
+    if(position_angle > 0)
+        motor->direction = 0;
+    else
+        motor->direction = 1;
+    motor->motion_profile.phase_dist = motor->motion_profile.target_position / 2;
+    motor->motion_profile.current_position = 0;
+    // Get the motion maximum velocity and convert it into pulse per frame
+    if(motion_velocity > motor->MAX_INPUT_SPEED)
+        motion_velocity = motor->MAX_INPUT_SPEED;
+    motor->motion_profile.motion_velocity = (motion_velocity * motor->encoder_rev * 1.0) * time_frame / 60000.0;
+    // Get the motion acceleration and convert it into pulse per frame^2
+    motor->motion_profile.motion_acceleration = (motion_acel * motor->encoder_rev * 1.0) * time_frame / 60000.0;;
+    // Set the phase of the 
+    motor->motion_profile.phase = 0;
+    // Activate the motion of the motor
+    motor->moving = 1;
+    // Activate the timer interrupt
+    HAL_TIM_Base_Start_IT(htim);
+    return 1;
+}
+
+// Function to control the position of the motor by P controller
+void positionControlPID(TIM_HandleTypeDef* htim, PID_motor* motor)
+{
+    // Update the position of the motor
+    updatePosition(motor);
+    // Create motion profile of the robot
+    motionProfileTracking(motor);
+    // Update the P controller parameters
+    float p_output = (motor->motion_profile.command_position - motor->motion_profile.current_position) * motor->motion_profile.pos_Kp;
+    // Limit the input velocity
+    if(p_output > motor->motion_profile.motion_velocity)
+        p_output = motor->motion_profile.motion_velocity;
+    else if(p_output < - motor->motion_profile.motion_velocity)
+        p_output = - motor->motion_profile.motion_velocity;
+    else if((motor->direction == 0 && p_output <= 0) || (motor->direction == 1 && p_output >= 0))
+    {
+        dutyCycleUpdate(0, motor);
+        motorBrake(motor);
+        // Reaset the PID value
+        resetPID(motor);
+        // Stop the timer 
+        HAL_TIM_Base_Stop_IT(htim);
+        return;
+    }
+    // Feed the velocity to the motor
+    motor->targetPulsePerFrame = p_output;
+    // Get the direction of the motion
+    if(p_output > 0)
+        motor->direction = 0;
+    else
+        motor->direction = 1;
+    // Feed the velocity to the speed controller
+    speedControlPID(motor);
+}
